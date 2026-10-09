@@ -529,13 +529,36 @@ void restore_map()
     for (uint64_t i = start; i < align_ceil(end, page_size); i += page_size) {
         uint64_t *pte = pgtable_entry_kernel(i);
         uint64_t orig = *pte;
-        *pte = (orig | PTE_DBM) & ~PTE_RDONLY;
-        flush_tlb_kernel_page(i);
-        for (uint64_t j = i; j >= start && j < end && j < i + page_size; j += 8) {
-            *(uint64_t *)j = *(uint64_t *)(start_preset.map_backup + (j - start));
+        if (pte_valid_cont(orig)) {
+            // Contiguous mapping: the hardware enforces one set of attributes
+            // across the whole aligned CONT_PTES block, so clearing PTE_RDONLY
+            // on a single entry leaves the block read-only and the write-back
+            // below faults (seen on 5.10, whose kernel text containing the map
+            // anchor is cont-mapped; 4.19 is not and takes the else path
+            // unchanged). Unlock every entry of the block, write, then restore
+            // each entry exactly.
+            uint64_t *base = (uint64_t *)((uintptr_t)pte & ~(sizeof(*pte) * CONT_PTES - 1));
+            uint64_t saved[CONT_PTES];
+            uint64_t cva = i & CONT_PTE_MASK;
+            for (int k = 0; k < CONT_PTES; ++k) {
+                saved[k] = base[k];
+                base[k] = (base[k] | PTE_DBM) & ~PTE_RDONLY;
+            }
+            flush_tlb_kernel_range(cva, cva + CONT_PTES * page_size);
+            for (uint64_t j = i; j >= start && j < end && j < i + page_size; j += 8) {
+                *(uint64_t *)j = *(uint64_t *)(start_preset.map_backup + (j - start));
+            }
+            for (int k = 0; k < CONT_PTES; ++k) base[k] = saved[k];
+            flush_tlb_kernel_range(cva, cva + CONT_PTES * page_size);
+        } else {
+            *pte = (orig | PTE_DBM) & ~PTE_RDONLY;
+            flush_tlb_kernel_page(i);
+            for (uint64_t j = i; j >= start && j < end && j < i + page_size; j += 8) {
+                *(uint64_t *)j = *(uint64_t *)(start_preset.map_backup + (j - start));
+            }
+            *pte = orig;
+            flush_tlb_kernel_page(i);
         }
-        *pte = orig;
-        flush_tlb_kernel_page(i);
     }
     flush_icache_all();
 }
